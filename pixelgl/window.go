@@ -205,6 +205,14 @@ func (w *Window) Update() {
 	w.UpdateInput()
 }
 
+func (w *Window) ClipboardText() string {
+	return w.window.GetClipboardString()
+}
+
+func (w *Window) SetClipboardText(text string) {
+	w.window.SetClipboardString(text)
+}
+
 // SwapBuffers swaps buffers. Call this to swap buffers without polling window events.
 // Note that Update invokes SwapBuffers.
 func (w *Window) SwapBuffers() {
@@ -405,10 +413,10 @@ func (w *Window) SetCursorVisible(visible bool) {
 // SetCursorDisabled hides the cursor and provides unlimited virtual cursor movement
 // make cursor visible using SetCursorVisible
 func (w *Window) SetCursorDisabled() {
-    w.cursorVisible = false
-    mainthread.Call(func() {
-        w.window.SetInputMode(glfw.CursorMode, glfw.CursorDisabled)
-    })
+	w.cursorVisible = false
+	mainthread.Call(func() {
+		w.window.SetInputMode(glfw.CursorMode, glfw.CursorDisabled)
+	})
 }
 
 // CursorVisible returns the visibility status of the mouse cursor.
