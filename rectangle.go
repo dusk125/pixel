@@ -27,6 +27,10 @@ func R(minX, minY, maxX, maxY float64) Rect {
 	}
 }
 
+func Rwh(x, y, w, h float64) Rect {
+	return R(x, y, w+x, h+y)
+}
+
 // String returns the string representation of the Rect.
 //
 //	r := pixel.R(100, 50, 200, 300)

@@ -76,6 +76,7 @@ func (c *Canvas) MakeTriangles(t pixel.Triangles) pixel.TargetTriangles {
 //
 // PictureColor is supported.
 func (c *Canvas) MakePicture(p pixel.Picture) pixel.TargetPicture {
+	// TODO dusk125 - convert to type switch
 	if cp, ok := p.(*canvasPicture); ok {
 		return &canvasPicture{
 			GLPicture: cp.GLPicture,
