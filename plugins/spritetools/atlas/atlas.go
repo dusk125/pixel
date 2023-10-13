@@ -1,280 +1,253 @@
 package atlas
 
 import (
-	"cmp"
-	"errors"
-	"image/jpeg"
+	"embed"
+	"fmt"
+	"image"
+	"image/draw"
 	"image/png"
+	"log"
 	"os"
-	"path"
 	"sort"
 
 	"github.com/gopxl/pixel/v2"
-	"github.com/gopxl/pixel/v2/plugins/spritetools"
-	"golang.org/x/exp/slices"
 )
 
-// This texture packer algorithm is based on this project
-// https://github.com/TeamHypersomnia/rectpack2D
-
-var (
-	ErrNoEmptySpace       = errors.New("Couldn't find an empty space")
-	ErrSplitFailed        = errors.New("Split failed")
-	ErrGrowthFailed       = errors.New("A previously added texture failed to be added after packer growth")
-	ErrUnsupportedSaveExt = errors.New("Unsupported save filename extension")
-	ErrNotPacked          = errors.New("Packer must be packed")
-	ErrNotFoundNoDefault  = errors.New("Id doesn't exist and a default sprite wasn't specified")
-	ErrAlreadyPacked      = errors.New("Pack has already been called for this packer")
-)
-
-type PackFlags uint8
-type CreateFlags uint8
-
-type PackerCfg struct {
-	Flags CreateFlags
+type embedEntry struct {
+	is bool
+	fs embed.FS
 }
 
-type Packer[K comparable] struct {
-	cfg         PackerCfg
-	bounds      pixel.Rect
-	emptySpaces []pixel.Rect
-	queued      []queuedData[K]
-	rects       map[K]pixel.Rect
-	images      map[K]*pixel.PictureData
-	pic         *pixel.PictureData
-	packed      bool
+type newEntry struct {
+	id     uint32
+	path   string
+	bounds image.Rectangle
+	frame  image.Point
+	embed  embedEntry
 }
 
-// Creates a new packer instance
-func NewAtlas[K comparable](cfg PackerCfg) (pack *Packer[K]) {
-	bounds := rect(0, 0, 0, 0)
-	pack = &Packer[K]{
-		cfg:         cfg,
-		bounds:      bounds,
-		emptySpaces: make([]pixel.Rect, 0),
-		rects:       make(map[K]pixel.Rect),
-		images:      make(map[K]*pixel.PictureData),
-		queued:      make([]queuedData[K], 0),
-	}
-	return
+type loc struct {
+	index int
+	rect  image.Rectangle
 }
 
-// Inserts PictureData into the packer
-func (pack *Packer[K]) Insert(id K, pic *pixel.PictureData) {
-	pack.queued = append(pack.queued, queuedData[K]{id: id, pic: pic})
+type spaces []image.Rectangle
+
+type sheet struct {
+	size   image.Rectangle
+	spaces spaces
 }
 
-// Automatically parse and insert image from file.
-func (pack *Packer[K]) InsertFromFile(id K, filename string) (err error) {
-	pic, err := spritetools.LoadPictureData(filename)
-	if err != nil {
-		return
-	}
-
-	pack.Insert(id, pic)
-
-	return
+type Atlas struct {
+	adding   []newEntry
+	internal []*pixel.PictureData
+	clean    bool
+	idMap    map[uint32]loc
+	id       uint32
 }
 
-// Helper to find the smallest empty space that'll fit the given bounds
-func (pack Packer[K]) find(bounds pixel.Rect) (index int, found bool) {
-	for i, space := range pack.emptySpaces {
-		if bounds.W() <= space.W() && bounds.H() <= space.H() {
-			return i, true
-		}
-	}
-	return
-}
-
-// Helper to remove a canidate empty space and return it
-func (pack *Packer[K]) remove(i int) (removed pixel.Rect) {
-	removed = pack.emptySpaces[i]
-	pack.emptySpaces = append(pack.emptySpaces[:i], pack.emptySpaces[i+1:]...)
-	return
-}
-
-// Helper to increase the size of the internal texture and readd the queued textures to keep it defragmented
-func (pack *Packer[K]) grow(growBy pixel.Vec, endex int) (err error) {
-	newSize := pack.bounds.Size().Add(growBy)
-	pack.bounds = rect(pack.bounds.Min.X, pack.bounds.Min.Y, newSize.X, newSize.Y)
-	pack.emptySpaces = []pixel.Rect{pack.bounds}
-
-	for _, data := range pack.queued[0:endex] {
-		if err = pack.insert(data); err != nil {
-			return
-		}
-	}
-
-	return
-}
-
-// Helper to segment a found space so that the given data can fit in what's left
-func (pack *Packer[K]) insert(data queuedData[K]) (err error) {
-	var (
-		s            *createdSplits
-		bounds       = data.pic.Bounds()
-		index, found = pack.find(bounds)
-	)
-
-	if !found {
-		return ErrGrowthFailed
-	}
-
-	space := pack.remove(index)
-	if s, err = split(bounds, space); err != nil {
-		return
-	}
-
-	if s.hasBig {
-		pack.emptySpaces = append(pack.emptySpaces, s.bigger)
-	}
-	if s.hasSmall {
-		pack.emptySpaces = append(pack.emptySpaces, s.smaller)
-	}
-
-	slices.SortStableFunc(pack.emptySpaces, func(i, j pixel.Rect) int {
-		return cmp.Compare(area(i), area(j))
-	})
-
-	pack.rects[data.id] = rect(space.Min.X, space.Min.Y, bounds.W(), bounds.H())
-	pack.images[data.id] = data.pic
-	return
-}
-
-// Pack takes the added textures and packs them into the packer texture, growing the texture if necessary.
-func (pack *Packer[K]) Pack() (err error) {
-	if pack.packed {
-		return ErrAlreadyPacked
-	}
-
-	// sort queued images largest to smallest
-	sort.SliceStable(pack.queued, func(i, j int) bool {
-		return area(pack.queued[i].pic.Bounds()) > area(pack.queued[j].pic.Bounds())
-	})
-
-	for i, data := range pack.queued {
-		var (
-			bounds   = data.pic.Bounds()
-			_, found = pack.find(bounds)
-		)
-
-		if !found {
-			if err = pack.grow(bounds.Size(), i); err != nil {
-				return
-			}
-		}
-
-		if err = pack.insert(data); err != nil {
-			return
-		}
-	}
-
-	// img := image.NewRGBA(image.Rect(int(pack.bounds.Min.X), int(pack.bounds.Min.Y), int(pack.bounds.Max.X), int(pack.bounds.Max.Y)))
-	// for id, pic := range pack.images {
-	// for x := 0; x < int(pic.Bounds().W()); x++ {
-	// 	for y := 0; y < int(pic.Bounds().H()); y++ {
-	// 		var (
-	// 			rect = pack.rects[id]
-	// 		)
-	// 		img.Set(x+rect.Min.X, y+rect.Min.Y, pic.At(x, y))
-	// 	}
-	// }
-	// }
-
-	pack.pic = pixel.MakePictureData(pack.bounds)
-	for id, pic := range pack.images {
-		var x, y float64
-		for x = 0; x < pic.Bounds().W(); x++ {
-			for y = 0; y < pic.Bounds().H(); y++ {
-				var (
-					rect = pack.rects[id]
-					pos  = pixel.V(x+rect.Min.X, y+rect.Min.Y)
-					ind  = pack.pic.Index(pos)
-				)
-				pack.pic.Pix[ind] = pic.Pix[pic.Index(pixel.V(x, y))]
-			}
-		}
-	}
-
-	pack.queued = nil
-	pack.emptySpaces = nil
-	pack.images = nil
-	pack.packed = true
-
-	return
-}
-
-// Saves the internal texture as a file on disk, the output type is defined by the filename extension
-func (pack *Packer[K]) Export(filename string) (err error) {
-	if !pack.packed {
-		return ErrNotPacked
-	}
-
-	var (
-		file *os.File
-	)
-
-	if err = os.Remove(filename); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return
-	}
-
-	if file, err = os.Create(filename); err != nil {
-		return
-	}
-	defer file.Close()
-
-	switch path.Ext(filename) {
-	case ".png":
-		err = png.Encode(file, pack.pic.Image())
-	case ".jpeg", ".jpg":
-		err = jpeg.Encode(file, pack.pic.Image(), nil)
-	default:
-		err = ErrUnsupportedSaveExt
-	}
-	if err != nil {
-		return
-	}
-
-	return
-}
-
-// Returns the subimage bounds from the given id
-func (pack *Packer[K]) Get(id K) (rect pixel.Rect) {
-	if !pack.packed {
-		panic(ErrNotPacked)
-	}
-
-	var has bool
-	if rect, has = pack.rects[id]; !has {
-		panic(ErrNotFoundNoDefault)
-	}
-	return
-}
-
-// Returns the subimage, as a copy, from the given id
-// func (pack *Atlas[K]) SubImage(id K) (img *image.RGBA) {
-// 	if !pack.packed {
-// 		panic(ErrNotPacked)
+// func (a *Atlas) Debug() {
+// 	if imgui.BeginChild("Atlas") {
+// 		if imgui.BeginTabBar("##tabs") {
+// 			for i, sprite := range a.internal {
+// 				imgui.PushIDInt(i)
+// 				if imgui.BeginTabItem(fmt.Sprintf("%v", i)) {
+// 					imgui.Textf("%v", sprite.Bounds())
+// 					imgui.Image(sprite.TextureID(), sprite.Size().Im().Times(0.5))
+// 				}
+// 				imgui.EndTabItem()
+// 				imgui.PopID()
+// 			}
+// 		}
+// 		imgui.EndTabBar()
 // 	}
-
-// 	r := pack.Get(id)
-// 	i := pack.pic.PixOffset(r.Min.X, r.Min.Y)
-// 	return &image.RGBA{
-// 		Pix:    pack.pic.Pix[i:],
-// 		Stride: pack.pic.Stride,
-// 		Rect:   image.Rect(0, 0, r.W(), r.H()),
-// 	}
+// 	imgui.EndChild()
 // }
 
-func (pack *Packer[K]) Bounds() pixel.Rect {
-	return pack.Picture().Bounds()
+func (a *Atlas) Dump() {
+	for i, t := range a.internal {
+		f, err := os.Create(fmt.Sprintf("%v.png", i))
+		if err != nil {
+			log.Println(i, err)
+			continue
+		}
+		defer f.Close()
+
+		if err := png.Encode(f, t.Image()); err != nil {
+			log.Println(i, err)
+			continue
+		}
+	}
 }
 
-// Returns the entire packed image
-func (pack *Packer[K]) Picture() pixel.Picture {
-	if !pack.packed {
-		panic(ErrNotPacked)
+func (a *Atlas) AddEmbed(fs embed.FS, path string) (id TextureId) {
+	img, err := loadEmbedSprite(fs, path)
+	panicerr(err)
+	bounds := img.Bounds()
+	id = TextureId{id: a.id, atlas: a}
+	a.id++
+	a.adding = append(a.adding, newEntry{id: id.id, path: path, bounds: bounds, embed: embedEntry{is: true, fs: fs}})
+	a.clean = false
+	return
+}
+
+func (a *Atlas) AddFile(path string) (id TextureId) {
+	img, err := loadSprite(path)
+	panicerr(err)
+	bounds := img.Bounds()
+	id = TextureId{id: a.id, atlas: a}
+	a.id++
+	a.adding = append(a.adding, newEntry{id: id.id, path: path, bounds: bounds})
+	a.clean = false
+	return
+}
+
+func (a *Atlas) Slice(path string, cellSize image.Point) (id SliceId) {
+	img, err := loadSprite(path)
+	panicerr(err)
+	bounds := img.Bounds()
+	panicif(bounds.Dx()%cellSize.X != 0 || bounds.Dy()%cellSize.Y != 0, "Texture size (%v,%v) must be multiple of cellSize (%v,%v)", bounds.Dx(), bounds.Dy(), cellSize.X, cellSize.Y)
+
+	id = SliceId{id: a.id, atlas: a}
+	a.id += uint32((bounds.Dx() / cellSize.X) * (bounds.Dy() / cellSize.Y))
+	a.adding = append(a.adding, newEntry{id: id.id, path: path, bounds: bounds, frame: cellSize})
+	a.clean = false
+	return
+}
+
+func (a *Atlas) SliceEmbed(fs embed.FS, path string, cellSize image.Point) (id SliceId) {
+	img, err := loadEmbedSprite(fs, path)
+	panicerr(err)
+	bounds := img.Bounds()
+	panicif(bounds.Dx()%cellSize.X != 0 || bounds.Dy()%cellSize.Y != 0, "Texture size (%v,%v) must be multiple of cellSize (%v,%v)", bounds.Dx(), bounds.Dy(), cellSize.X, cellSize.Y)
+
+	id = SliceId{id: a.id, atlas: a}
+	a.id += uint32((bounds.Dx() / cellSize.X) * (bounds.Dy() / cellSize.Y))
+	a.adding = append(a.adding, newEntry{id: id.id, path: path, bounds: bounds, frame: cellSize, embed: embedEntry{is: true, fs: fs}})
+	a.clean = false
+	return
+}
+
+// Pack takes all of the added textures and adds them to the atlas largest to smallest,
+//
+//	trying to waste as little space as possible. After this call, the textures added
+//	to the atlas can be used.
+func (a *Atlas) Pack(maxSheetW, maxSheetH int) (err error) {
+	// If there's nothing to do, don't do anything
+	if a.clean {
+		return
 	}
 
-	return pack.pic
+	// reset internal stuff
+	a.internal = a.internal[:0]
+	a.idMap = make(map[uint32]loc)
+
+	sort.Slice(a.adding, func(i, j int) bool {
+		return area(a.adding[i].bounds) >= area(a.adding[j].bounds)
+	})
+
+	sheets := make([]sheet, 1)
+	for i := range sheets {
+		sheets[i] = sheet{
+			spaces: []image.Rectangle{image.Rect(0, 0, maxSheetW, maxSheetH)},
+		}
+	}
+
+	for _, add := range a.adding {
+		bw, bh := add.bounds.Dx(), add.bounds.Dy()
+
+		if bw > maxSheetW || bh > maxSheetH {
+			return fmt.Errorf("Texture for %v is larger (%v, %v) than the maximum allowed texture (%v, %v)", add.path, bw, bh, maxSheetW, maxSheetH)
+		}
+
+		found := image.Rectangle{}
+		foundI := -1
+
+	Loop:
+		for i := range sheets {
+			for j := range sheets[i].spaces {
+				found, sheets[i].spaces = split(sheets[i].spaces, j, bw, bh)
+				if found.Empty() {
+					continue
+				}
+				sort.Slice(sheets[i].spaces, func(a, b int) bool {
+					return area(sheets[i].spaces[a]) < area(sheets[i].spaces[b])
+				})
+				foundI = i
+				break Loop
+			}
+		}
+
+		if foundI == -1 {
+			foundI = len(sheets)
+			sheets = append(sheets, sheet{})
+			found, sheets[foundI].spaces = split([]image.Rectangle{image.Rect(0, 0, maxSheetW, maxSheetH)}, 0, bw, bh)
+		}
+
+		// Increase the size of the packer so we can allocate the minimum-sized
+		// 	texture later.
+		if found.Min.X == 0 {
+			sheets[foundI].size.Max.Y += found.Dy()
+		}
+		if found.Min.Y == 0 {
+			sheets[foundI].size.Max.X += found.Dx()
+		}
+
+		if add.frame.Eq(image.Point{}) {
+			// Found a spot, add it to the map
+			a.idMap[add.id] = loc{
+				index: foundI,
+				rect:  found,
+			}
+		} else {
+			// If we have a frame, that means we just added a sprite sheet to the sprite sheet
+			// 	so we need to add id entries for each of the sprites
+			id := add.id
+			for y := 0; y < add.bounds.Dy(); y += add.frame.Y {
+				for x := 0; x < add.bounds.Dx(); x += add.frame.X {
+					a.idMap[id] = loc{
+						index: foundI,
+						rect:  rect(found.Min.X+x, found.Min.Y+y, add.frame.X, add.frame.Y),
+					}
+					id++
+				}
+			}
+		}
+	}
+
+	// Create internal textures
+	sprites := make([]*image.RGBA, len(sheets))
+	for i := range sheets {
+		if !sheets[i].size.Empty() {
+			sprites[i] = image.NewRGBA(sheets[i].size)
+		}
+	}
+
+	// Copy individual sprite data into internal textures
+	for _, add := range a.adding {
+		var (
+			err    error
+			sprite image.Image
+			s      = a.idMap[add.id]
+		)
+		if add.embed.is {
+			sprite, err = loadEmbedSprite(add.embed.fs, add.path)
+		} else {
+			sprite, err = loadSprite(add.path)
+		}
+		if err != nil {
+			return err
+		}
+		draw.Draw(sprites[s.index], rect(s.rect.Min.X, s.rect.Min.Y, add.bounds.Dx(), add.bounds.Dy()), sprite, image.Point{}, draw.Src)
+	}
+
+	a.internal = make([]*pixel.PictureData, len(sprites))
+	for i, sprite := range sprites {
+		a.internal[i] = pixel.PictureDataFromImage(sprite)
+	}
+
+	a.adding = nil
+	a.clean = true
+
+	return
 }
